@@ -46,6 +46,9 @@ COOKIES_FILE=cookies.txt
 touch cookies.txt
 ```
 
+Файл `cookies.txt` подключается в контейнер с правом записи, потому что `yt-dlp`
+может обновлять cookies во время скачивания.
+
 Запустите контейнер:
 
 ```bash

@@ -7,4 +7,4 @@ services:
     restart: unless-stopped
     volumes:
       - ./.env:/app/.env:ro
-      - ./cookies.txt:/app/cookies.txt:ro
+      - ./cookies.txt:/app/cookies.txt
