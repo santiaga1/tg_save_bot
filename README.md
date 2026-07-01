@@ -1,6 +1,6 @@
 # Telegram video saver bot
 
-Бот следит за сообщениями в группе. Если кто-то отправляет ссылку на Instagram или TikTok видео, бот скачивает ролик через `yt-dlp` и отправляет видео обратно в тот же чат.
+Бот следит за сообщениями в группе. Если кто-то отправляет ссылку на Instagram, TikTok или YouTube Shorts видео, бот скачивает ролик через `yt-dlp` и отправляет видео обратно в тот же чат.
 
 ## Важные условия
 
@@ -24,6 +24,44 @@ cp .env.example .env
 
 ```bash
 python bot.py
+```
+
+## Запуск в Docker
+
+Создайте `.env` из примера и укажите `BOT_TOKEN`:
+
+```bash
+cp .env.example .env
+```
+
+Если используете cookies, положите `cookies.txt` в папку проекта и укажите в `.env`:
+
+```env
+COOKIES_FILE=cookies.txt
+```
+
+Если cookies не нужны, создайте пустой файл, чтобы volume подключился как файл:
+
+```bash
+touch cookies.txt
+```
+
+Запустите контейнер:
+
+```bash
+docker compose up -d --build
+```
+
+Посмотреть логи:
+
+```bash
+docker compose logs -f bot
+```
+
+Остановить:
+
+```bash
+docker compose down
 ```
 
 ## Cookies для Instagram/TikTok

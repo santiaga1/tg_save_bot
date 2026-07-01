@@ -1,9 +1,9 @@
 """
-Telegram-бот для автоматической отправки видео из Instagram и TikTok.
+Telegram-бот для автоматической отправки видео из Instagram, TikTok и YouTube Shorts.
 
 Как работает:
 1. Бот получает каждое текстовое сообщение в группе.
-2. Ищет в тексте ссылки на Instagram или TikTok.
+2. Ищет в тексте ссылки на Instagram, TikTok или YouTube Shorts.
 3. Скачивает первое найденное видео через yt-dlp.
 4. Отправляет скачанный файл обратно в тот же чат.
 
@@ -60,6 +60,12 @@ SUPPORTED_DOMAINS = {
     "vt.tiktok.com",
 }
 
+YOUTUBE_SHORTS_DOMAINS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+}
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -112,9 +118,24 @@ def load_settings() -> Settings:
     )
 
 
+def is_supported_url(url: str) -> bool:
+    """Проверяет, относится ли ссылка к поддерживаемым форматам видео."""
+
+    parsed_url = urlparse(url)
+    hostname = parsed_url.hostname.lower() if parsed_url.hostname else ""
+
+    if hostname in SUPPORTED_DOMAINS:
+        return True
+
+    if hostname in YOUTUBE_SHORTS_DOMAINS:
+        return parsed_url.path.startswith("/shorts/")
+
+    return False
+
+
 def extract_supported_urls(text: str) -> list[str]:
     """
-    Достает из текста ссылки Instagram/TikTok.
+    Достает из текста ссылки Instagram/TikTok/YouTube Shorts.
 
     Telegram может прислать ссылку с пунктуацией в конце, например:
     "смотри https://vm.tiktok.com/abc/."
@@ -125,9 +146,8 @@ def extract_supported_urls(text: str) -> list[str]:
 
     for match in URL_RE.finditer(text):
         url = match.group(0).rstrip(".,!?;:)]}")
-        hostname = urlparse(url).hostname
 
-        if hostname and hostname.lower() in SUPPORTED_DOMAINS:
+        if is_supported_url(url):
             urls.append(url)
 
     return urls

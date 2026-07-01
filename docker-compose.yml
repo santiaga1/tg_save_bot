@@ -1,0 +1,10 @@
+services:
+  bot:
+    build:
+      context: https://github.com/santiaga1/tg_save_bot.git
+      dockerfile: Dockerfile
+    container_name: tg-save-bot
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./cookies.txt:/app/cookies.txt:ro
