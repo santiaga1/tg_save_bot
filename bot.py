@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from telegram import Message, Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
 
@@ -65,6 +66,9 @@ YOUTUBE_SHORTS_DOMAINS = {
     "www.youtube.com",
     "m.youtube.com",
 }
+
+TELEGRAM_VIDEO_LIMIT_MB = 50
+TELEGRAM_VIDEO_LIMIT_BYTES = TELEGRAM_VIDEO_LIMIT_MB * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -232,6 +236,32 @@ def cleanup_download(video: DownloadedVideo) -> None:
     shutil.rmtree(video.path.parent, ignore_errors=True)
 
 
+def format_file_size_mb(file_size: int) -> str:
+    """Форматирует размер файла в мегабайтах для сообщений пользователю."""
+
+    return f"{file_size / 1024 / 1024:.1f} MB"
+
+
+def is_telegram_file_too_large_error(exc: TelegramError) -> bool:
+    """Проверяет, похожа ли ошибка Telegram на отказ из-за размера файла."""
+
+    message = str(exc).lower()
+    return (
+        "file is too big" in message
+        or "file_too_big" in message
+        or "request entity too large" in message
+    )
+
+
+async def show_video_too_large_message(status_message: Message, file_size: int) -> None:
+    """Показывает понятную ошибку, когда видео нельзя отправить из-за размера."""
+
+    await status_message.edit_text(
+        f"Видео получилось слишком большим: {format_file_size_mb(file_size)}. "
+        f"Telegram не дает боту отправлять видео больше {TELEGRAM_VIDEO_LIMIT_MB} MB."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ответ на /start в личке или группе."""
 
@@ -272,9 +302,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         video = await download_video(url, settings)
         file_size = video.path.stat().st_size
 
+        if file_size > TELEGRAM_VIDEO_LIMIT_BYTES:
+            await show_video_too_large_message(status_message, file_size)
+            return
+
         if file_size > settings.max_video_bytes:
             await status_message.edit_text(
-                f"Видео получилось слишком большим: {file_size / 1024 / 1024:.1f} MB. "
+                f"Видео получилось слишком большим: {format_file_size_mb(file_size)}. "
                 f"Лимит сейчас: {settings.max_video_mb} MB."
             )
             return
@@ -292,6 +326,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
 
         await status_message.delete()
+    except TelegramError as exc:
+        if video and is_telegram_file_too_large_error(exc):
+            logger.warning("Telegram отказался отправить слишком большое видео: %s", url)
+            await show_video_too_large_message(status_message, video.path.stat().st_size)
+            return
+
+        logger.exception("Не удалось отправить видео по ссылке %s", url)
+        await status_message.edit_text(
+            "Не получилось отправить видео в Telegram. Попробуйте ссылку на ролик поменьше."
+        )
     except Exception as exc:
         logger.exception("Не удалось обработать ссылку %s", url)
         await status_message.edit_text(
