@@ -33,6 +33,7 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 
 # Логирование нужно не только для ошибок: по нему удобно понять, какие ссылки
@@ -253,12 +254,35 @@ def is_telegram_file_too_large_error(exc: TelegramError) -> bool:
     )
 
 
+def is_ydl_file_too_large_error(exc: DownloadError) -> bool:
+    """Проверяет, отказался ли yt-dlp скачивать файл из-за max_filesize."""
+
+    message = str(exc).lower()
+    return (
+        "max-filesize" in message
+        or "max_filesize" in message
+        or "larger than" in message and "file" in message
+    )
+
+
 async def show_video_too_large_message(status_message: Message, file_size: int) -> None:
     """Показывает понятную ошибку, когда видео нельзя отправить из-за размера."""
 
     await status_message.edit_text(
         f"Видео получилось слишком большим: {format_file_size_mb(file_size)}. "
         f"Telegram не дает боту отправлять видео больше {TELEGRAM_VIDEO_LIMIT_MB} MB."
+    )
+
+
+async def show_download_too_large_message(
+    status_message: Message,
+    settings: Settings,
+) -> None:
+    """Показывает ошибку, когда yt-dlp не скачал видео из-за лимита размера."""
+
+    await status_message.edit_text(
+        f"Видео слишком большое и не может быть отправлено. "
+        f"Бот не стал его скачивать, потому что лимит сейчас: {settings.max_video_mb} MB."
     )
 
 
@@ -335,6 +359,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.exception("Не удалось отправить видео по ссылке %s", url)
         await status_message.edit_text(
             "Не получилось отправить видео в Telegram. Попробуйте ссылку на ролик поменьше."
+        )
+    except DownloadError as exc:
+        if is_ydl_file_too_large_error(exc):
+            logger.warning("yt-dlp отказался скачивать слишком большое видео: %s", url)
+            await show_download_too_large_message(status_message, settings)
+            return
+
+        logger.exception("yt-dlp не смог скачать видео по ссылке %s", url)
+        await status_message.edit_text(
+            "Не получилось скачать видео. "
+            "Возможно, ссылка приватная, нужен cookies-файл или платформа временно изменила защиту."
         )
     except Exception as exc:
         logger.exception("Не удалось обработать ссылку %s", url)
