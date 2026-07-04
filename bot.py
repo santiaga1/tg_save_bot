@@ -24,7 +24,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -95,6 +95,15 @@ class DownloadedVideo:
     title: str | None
 
 
+class VideoTooLargeError(Exception):
+    """Видео превышает лимит размера до или после скачивания."""
+
+    def __init__(self, file_size: int | None, limit_mb: int) -> None:
+        super().__init__("Видео слишком большое.")
+        self.file_size = file_size
+        self.limit_mb = limit_mb
+
+
 def load_settings() -> Settings:
     """Загружает настройки из .env и окружения."""
 
@@ -104,7 +113,7 @@ def load_settings() -> Settings:
     if not bot_token:
         raise RuntimeError("Не задан BOT_TOKEN. Создайте .env по примеру .env.example.")
 
-    max_video_mb_raw = os.getenv("MAX_VIDEO_MB", "45").strip()
+    max_video_mb_raw = os.getenv("MAX_VIDEO_MB", "48").strip()
     try:
         max_video_mb = int(max_video_mb_raw)
     except ValueError as exc:
@@ -158,7 +167,12 @@ def extract_supported_urls(text: str) -> list[str]:
     return urls
 
 
-def build_ydl_options(download_dir: Path, settings: Settings) -> dict:
+def build_ydl_options(
+    download_dir: Path,
+    settings: Settings,
+    *,
+    use_max_filesize: bool = True,
+) -> dict:
     """
     Собирает настройки yt-dlp.
 
@@ -174,15 +188,52 @@ def build_ydl_options(download_dir: Path, settings: Settings) -> dict:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+    }
+
+    if use_max_filesize:
         # Этот лимит не гарантирует, что файл всегда будет меньше лимита Telegram,
         # но помогает yt-dlp заранее отказаться от слишком больших роликов.
-        "max_filesize": settings.max_video_bytes,
-    }
+        options["max_filesize"] = settings.max_video_bytes
 
     if settings.cookies_file:
         options["cookiefile"] = str(settings.cookies_file)
 
     return options
+
+
+def get_info_file_size(info: dict[str, Any]) -> int | None:
+    """Достает лучший известный размер файла из metadata yt-dlp."""
+
+    for key in ("filesize", "filesize_approx"):
+        file_size = info.get(key)
+        if isinstance(file_size, (int, float)) and file_size > 0:
+            return int(file_size)
+
+    for requested_items_key in ("requested_downloads", "requested_formats"):
+        requested_items = info.get(requested_items_key)
+        if not isinstance(requested_items, list):
+            continue
+
+        sizes = [
+            item.get("filesize") or item.get("filesize_approx")
+            for item in requested_items
+            if isinstance(item, dict)
+        ]
+        numeric_sizes = [
+            int(size) for size in sizes if isinstance(size, (int, float)) and size > 0
+        ]
+        if numeric_sizes:
+            return sum(numeric_sizes)
+
+    return None
+
+
+def check_info_size(info: dict[str, Any], settings: Settings) -> None:
+    """Проверяет metadata перед скачиванием, если платформа отдала размер."""
+
+    file_size = get_info_file_size(info)
+    if file_size and file_size > settings.max_video_bytes:
+        raise VideoTooLargeError(file_size, settings.max_video_mb)
 
 
 def find_downloaded_file(before: Iterable[Path], download_dir: Path) -> Path:
@@ -215,6 +266,13 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
     before = list(download_dir.iterdir())
 
     try:
+        with YoutubeDL(
+            build_ydl_options(download_dir, settings, use_max_filesize=False)
+        ) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                check_info_size(info, settings)
+
         with YoutubeDL(build_ydl_options(download_dir, settings)) as ydl:
             info = ydl.extract_info(url, download=True)
 
@@ -277,11 +335,13 @@ async def show_video_too_large_message(status_message: Message, file_size: int) 
 async def show_download_too_large_message(
     status_message: Message,
     settings: Settings,
+    file_size: int | None = None,
 ) -> None:
     """Показывает ошибку, когда yt-dlp не скачал видео из-за лимита размера."""
 
+    size_text = f" Размер видео: {format_file_size_mb(file_size)}." if file_size else ""
     await status_message.edit_text(
-        f"Видео слишком большое и не может быть отправлено. "
+        f"Видео слишком большое и не может быть отправлено.{size_text} "
         f"Бот не стал его скачивать, потому что лимит сейчас: {settings.max_video_mb} MB."
     )
 
@@ -360,6 +420,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await status_message.edit_text(
             "Не получилось отправить видео в Telegram. Попробуйте ссылку на ролик поменьше."
         )
+    except VideoTooLargeError as exc:
+        logger.warning("Видео больше лимита и не будет скачано: %s", url)
+        await show_download_too_large_message(status_message, settings, exc.file_size)
     except DownloadError as exc:
         if is_ydl_file_too_large_error(exc):
             logger.warning("yt-dlp отказался скачивать слишком большое видео: %s", url)
