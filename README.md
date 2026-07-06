@@ -61,6 +61,10 @@ docker compose up -d --build
 docker compose up -d --build
 ```
 
+Для YouTube Shorts в `docker-compose.yml` поднимается отдельный сервис
+`pot-provider`. Он нужен `yt-dlp`, потому что YouTube постепенно требует
+PO Token для получения ссылок на видеоформаты.
+
 Посмотреть логи:
 
 ```bash
@@ -82,3 +86,18 @@ COOKIES_FILE=cookies.txt
 ```
 
 Используйте cookies только своего аккаунта и не публикуйте этот файл.
+
+## YouTube Shorts и PO Token
+
+Если YouTube Shorts падают с ошибкой `Requested format is not available`, это
+часто значит, что YouTube не отдал `yt-dlp` доступные видеоформаты. В Docker
+для этого уже подключен `bgutil-ytdlp-pot-provider`:
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+docker compose logs -f bot
+```
+
+В начале логов бот пишет версию `yt-dlp` и URL PO Token Provider. Если версия
+`yt-dlp` старая, пересоберите контейнер без cache.

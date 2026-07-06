@@ -1,10 +1,19 @@
 services:
+  pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: tg-save-bot-pot-provider
+    restart: unless-stopped
+
   bot:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: tg-save-bot
     restart: unless-stopped
+    depends_on:
+      - pot-provider
+    environment:
+      YTDLP_POT_PROVIDER_URL: http://pot-provider:4416
     volumes:
       - ./.env:/app/.env:ro
       - ./cookies.txt:/app/cookies.txt

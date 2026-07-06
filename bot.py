@@ -34,6 +34,7 @@ from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+from yt_dlp.version import __version__ as YTDLP_VERSION
 
 
 # Логирование нужно не только для ошибок: по нему удобно понять, какие ссылки
@@ -124,6 +125,7 @@ class Settings:
     bot_token: str
     max_video_mb: int
     cookies_file: Path | None
+    pot_provider_url: str | None
 
     @property
     def max_video_bytes(self) -> int:
@@ -170,10 +172,13 @@ def load_settings() -> Settings:
     if cookies_file and not cookies_file.exists():
         raise RuntimeError(f"Файл cookies не найден: {cookies_file}")
 
+    pot_provider_url = os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None
+
     return Settings(
         bot_token=bot_token,
         max_video_mb=max_video_mb,
         cookies_file=cookies_file,
+        pot_provider_url=pot_provider_url,
     )
 
 
@@ -289,6 +294,15 @@ def build_ydl_options(
             "youtube": {
                 "player_client": youtube_player_clients,
             },
+        }
+
+    if settings.pot_provider_url:
+        # YouTube постепенно требует PO Token для получения/скачивания форматов.
+        # bgutil-ytdlp-pot-provider отдает токены через HTTP, а yt-dlp-плагин
+        # подхватывает этот extractor arg и добавляет токены к YouTube-запросам.
+        options.setdefault("extractor_args", {})
+        options["extractor_args"]["youtubepot-bgutilhttp"] = {
+            "base_url": [settings.pot_provider_url],
         }
 
     if format_selector:
@@ -629,6 +643,9 @@ def main() -> None:
     settings = load_settings()
     application = build_application(settings)
 
+    logger.info("yt-dlp version: %s", YTDLP_VERSION)
+    if settings.pot_provider_url:
+        logger.info("YouTube PO Token provider: %s", settings.pot_provider_url)
     logger.info("Бот запущен. Остановить можно Ctrl+C.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
