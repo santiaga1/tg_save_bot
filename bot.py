@@ -89,6 +89,11 @@ YDL_DOWNLOAD_STRATEGIES: list[dict[str, Any]] = [
         "youtube_player_clients": ["web_safari", "mweb", "android_vr"],
     },
     {
+        "name": "mweb client с PO Token",
+        "format_selector": None,
+        "youtube_player_clients": ["mweb"],
+    },
+    {
         "name": "tv client",
         "format_selector": None,
         "youtube_player_clients": ["tv"],
@@ -242,6 +247,39 @@ def normalize_url_for_download(url: str) -> str:
         )
 
     return url
+
+
+def get_download_url_candidates(url: str) -> list[str]:
+    """
+    Возвращает варианты одной и той же ссылки для yt-dlp.
+
+    Для YouTube Shorts дополнительно пробуем обычный watch URL. Иногда YouTube
+    отдает разные metadata для /shorts/<id> и /watch?v=<id>, хотя это один ролик.
+    """
+
+    normalized_url = normalize_url_for_download(url)
+    parsed_url = urlparse(normalized_url)
+    hostname = parsed_url.hostname.lower() if parsed_url.hostname else ""
+
+    if hostname not in YOUTUBE_SHORTS_DOMAINS or not parsed_url.path.startswith("/shorts/"):
+        return [normalized_url]
+
+    video_id = parsed_url.path.removeprefix("/shorts/").strip("/")
+    if not video_id:
+        return [normalized_url]
+
+    watch_url = urlunparse(
+        (
+            parsed_url.scheme or "https",
+            parsed_url.netloc,
+            "/watch",
+            "",
+            f"v={video_id}",
+            "",
+        )
+    )
+
+    return [normalized_url, watch_url]
 
 
 def build_ydl_options(
@@ -420,32 +458,38 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
 
         info: dict[str, Any] | None = None
         last_format_error: DownloadError | None = None
-        for strategy in YDL_DOWNLOAD_STRATEGIES:
-            strategy_name = str(strategy["name"])
-            try:
-                logger.info("Пробую стратегию '%s': %s", strategy_name, url)
-                with YoutubeDL(
-                    build_ydl_options(
-                        download_dir,
-                        settings,
-                        format_selector=strategy.get("format_selector"),
-                        youtube_player_clients=strategy.get("youtube_player_clients"),
-                        use_browser_headers=bool(strategy.get("use_browser_headers", True)),
-                        use_max_filesize=bool(strategy.get("use_max_filesize", True)),
-                    )
-                ) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                break
-            except DownloadError as exc:
-                if not is_requested_format_unavailable(exc):
-                    raise
+        downloaded = False
+        for candidate_url in get_download_url_candidates(url):
+            for strategy in YDL_DOWNLOAD_STRATEGIES:
+                strategy_name = str(strategy["name"])
+                try:
+                    logger.info("Пробую стратегию '%s': %s", strategy_name, candidate_url)
+                    with YoutubeDL(
+                        build_ydl_options(
+                            download_dir,
+                            settings,
+                            format_selector=strategy.get("format_selector"),
+                            youtube_player_clients=strategy.get("youtube_player_clients"),
+                            use_browser_headers=bool(strategy.get("use_browser_headers", True)),
+                            use_max_filesize=bool(strategy.get("use_max_filesize", True)),
+                        )
+                    ) as ydl:
+                        info = ydl.extract_info(candidate_url, download=True)
+                    downloaded = True
+                    break
+                except DownloadError as exc:
+                    if not is_requested_format_unavailable(exc):
+                        raise
 
-                last_format_error = exc
-                logger.info(
-                    "Стратегия '%s' не нашла доступный формат, пробую следующую: %s",
-                    strategy_name,
-                    url,
-                )
+                    last_format_error = exc
+                    logger.info(
+                        "Стратегия '%s' не нашла доступный формат, пробую следующую: %s",
+                        strategy_name,
+                        candidate_url,
+                    )
+
+            if downloaded:
+                break
         else:
             if last_format_error:
                 raise last_format_error
