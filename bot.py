@@ -311,20 +311,29 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
     before = list(download_dir.iterdir())
 
     try:
-        with YoutubeDL(
-            build_ydl_options(
-                download_dir,
-                settings,
-                use_max_filesize=False,
-                # Для проверки metadata берем самый широкий selector. Так preflight
-                # не падает на YouTube Shorts только из-за того, что MP4-вариант
-                # недоступен для конкретного ролика.
-                format_selector="best/bv*",
+        try:
+            with YoutubeDL(
+                build_ydl_options(
+                    download_dir,
+                    settings,
+                    use_max_filesize=False,
+                    # На preflight-шаге нам нужна только metadata для проверки
+                    # размера. Не задаем format selector и не обрабатываем formats,
+                    # иначе YouTube Shorts может упасть еще до fallback-скачивания.
+                    format_selector=None,
+                )
+            ) as ydl:
+                info = ydl.extract_info(url, download=False, process=False)
+                if info:
+                    check_info_size(info, settings)
+        except DownloadError as exc:
+            if not is_requested_format_unavailable(exc):
+                raise
+
+            logger.info(
+                "Preflight metadata не смог подобрать формат, перехожу к скачиванию: %s",
+                url,
             )
-        ) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if info:
-                check_info_size(info, settings)
 
         info: dict[str, Any] | None = None
         last_format_error: DownloadError | None = None
