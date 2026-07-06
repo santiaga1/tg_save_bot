@@ -49,8 +49,9 @@ logger = logging.getLogger(__name__)
 # После извлечения мы дополнительно проверяем домен, чтобы не трогать чужие ссылки.
 URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
 
-# Домены, которые бот считает поддерживаемыми.
-# Список можно расширить, если yt-dlp начнет поддерживать новые короткие домены.
+# Домены, которые бот считает поддерживаемыми без дополнительной проверки пути.
+# YouTube вынесен отдельно ниже, потому что нам нужны именно Shorts, а не любые
+# youtube-ссылки из чата.
 SUPPORTED_DOMAINS = {
     "instagram.com",
     "www.instagram.com",
@@ -181,13 +182,40 @@ def build_ydl_options(
     """
 
     options = {
-        # Скачиваем один лучший mp4-файл, если он доступен. Если платформа отдает
-        # видео/аудио отдельно, yt-dlp попробует собрать их через ffmpeg.
-        "format": "best[ext=mp4]/best",
+        # Стараемся получить MP4 до 720p: для Telegram-группы это обычно хороший
+        # баланс качества и размера. YouTube часто отдает видео и аудио отдельно,
+        # поэтому ffmpeg в Dockerfile нужен для склейки этих дорожек.
+        "format": (
+            "bv*[height<=720][ext=mp4]+ba[ext=m4a]/"
+            "b[height<=720][ext=mp4]/"
+            "bv*[height<=720]+ba/b[height<=720]/best"
+        ),
+        "merge_output_format": "mp4",
         "outtmpl": str(download_dir / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+        "concurrent_fragment_downloads": 4,
+        "http_headers": {
+            # YouTube иногда хуже отвечает на дефолтный Python user-agent.
+            # Обычный браузерный user-agent делает запросы менее "экзотичными".
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+        },
+        "extractor_args": {
+            # В свежем yt-dlp YouTube extractor умеет несколько client profiles.
+            # Явно просим несколько вариантов, чтобы Shorts не падали на первом
+            # неподходящем клиенте.
+            "youtube": {
+                "player_client": ["web_safari", "mweb", "android_vr"],
+            },
+        },
     }
 
     if use_max_filesize:
@@ -432,13 +460,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.exception("yt-dlp не смог скачать видео по ссылке %s", url)
         await status_message.edit_text(
             "Не получилось скачать видео. "
-            "Возможно, ссылка приватная, нужен cookies-файл или платформа временно изменила защиту."
+            "Обновите yt-dlp и, если это YouTube/Instagram, попробуйте cookies-файл. "
+            "Подробная причина есть в логах бота."
         )
     except Exception as exc:
         logger.exception("Не удалось обработать ссылку %s", url)
         await status_message.edit_text(
             "Не получилось скачать видео. "
-            "Возможно, ссылка приватная, нужен cookies-файл или платформа временно изменила защиту."
+            "Обновите yt-dlp и, если это YouTube/Instagram, попробуйте cookies-файл. "
+            "Подробная причина есть в логах бота."
         )
     finally:
         if video:
