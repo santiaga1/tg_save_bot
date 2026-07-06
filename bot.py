@@ -17,11 +17,14 @@ Telegram-бот для автоматической отправки видео 
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import os
 import re
 import shutil
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -70,6 +73,11 @@ YOUTUBE_SHORTS_DOMAINS = {
     "m.youtube.com",
 }
 
+YOUTUBE_DOMAINS = YOUTUBE_SHORTS_DOMAINS | {
+    "youtu.be",
+    "www.youtu.be",
+}
+
 TELEGRAM_VIDEO_LIMIT_MB = 50
 TELEGRAM_VIDEO_LIMIT_BYTES = TELEGRAM_VIDEO_LIMIT_MB * 1024 * 1024
 
@@ -92,6 +100,7 @@ YDL_DOWNLOAD_STRATEGIES: list[dict[str, Any]] = [
         "name": "mweb client с PO Token",
         "format_selector": None,
         "youtube_player_clients": ["mweb"],
+        "requires_pot": True,
     },
     {
         "name": "tv client",
@@ -156,6 +165,24 @@ class VideoTooLargeError(Exception):
         self.limit_mb = limit_mb
 
 
+class YtdlpLogger:
+    """Прокидывает сообщения yt-dlp в обычные логи приложения."""
+
+    def debug(self, message: str) -> None:
+        # yt-dlp пишет очень много debug-строк. В обычном режиме они только шумят.
+        if os.getenv("YTDLP_VERBOSE", "").strip() == "1":
+            logger.debug("yt-dlp: %s", message)
+
+    def info(self, message: str) -> None:
+        logger.info("yt-dlp: %s", message)
+
+    def warning(self, message: str) -> None:
+        logger.warning("yt-dlp: %s", message)
+
+    def error(self, message: str) -> None:
+        logger.error("yt-dlp: %s", message)
+
+
 def load_settings() -> Settings:
     """Загружает настройки из .env и окружения."""
 
@@ -200,6 +227,13 @@ def is_supported_url(url: str) -> bool:
         return parsed_url.path.startswith("/shorts/")
 
     return False
+
+
+def is_youtube_url(url: str) -> bool:
+    """Проверяет, что ссылка относится к YouTube."""
+
+    hostname = urlparse(url).hostname
+    return bool(hostname and hostname.lower() in YOUTUBE_DOMAINS)
 
 
 def extract_supported_urls(text: str) -> list[str]:
@@ -306,7 +340,8 @@ def build_ydl_options(
         "outtmpl": str(download_dir / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
+        "logger": YtdlpLogger(),
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
@@ -363,6 +398,68 @@ def is_requested_format_unavailable(exc: DownloadError) -> bool:
     """Проверяет, что yt-dlp упал именно из-за неподходящего format selector."""
 
     return "requested format is not available" in str(exc).lower()
+
+
+def is_pot_plugin_installed() -> bool:
+    """
+    Проверяет, видит ли Python yt-dlp plugin package.
+
+    У bgutil были разные внутренние имена модулей в релизах, поэтому проверяем
+    несколько вероятных путей. Если ни один не найден, PO Token Provider не будет
+    использоваться, даже если HTTP-сервис запущен.
+    """
+
+    plugin_modules = (
+        "yt_dlp_plugins.extractor.youtubepot_bgutil",
+        "yt_dlp_plugins.extractor.youtubepot_bgutilhttp",
+        "yt_dlp_plugins.extractor.bgutil",
+    )
+
+    for module_name in plugin_modules:
+        try:
+            if importlib.util.find_spec(module_name):
+                return True
+        except ModuleNotFoundError:
+            continue
+
+    return False
+
+
+def is_pot_provider_reachable(provider_url: str) -> bool:
+    """Проверяет, доступен ли HTTP PO Token Provider из контейнера бота."""
+
+    try:
+        with urllib.request.urlopen(provider_url, timeout=3):
+            return True
+    except urllib.error.HTTPError:
+        # HTTP-сервер ответил, даже если корневой путь вернул 404/405.
+        return True
+    except OSError as exc:
+        logger.warning("PO Token Provider недоступен по адресу %s: %s", provider_url, exc)
+        return False
+
+
+def log_youtube_runtime_state(settings: Settings) -> None:
+    """Пишет в лог состояние YouTube-зависимостей."""
+
+    logger.info("yt-dlp version: %s", YTDLP_VERSION)
+
+    if not settings.pot_provider_url:
+        logger.warning("YTDLP_POT_PROVIDER_URL не задан, YouTube PO Token отключен.")
+        return
+
+    logger.info("YouTube PO Token provider URL: %s", settings.pot_provider_url)
+
+    if not is_pot_plugin_installed():
+        logger.warning(
+            "bgutil-ytdlp-pot-provider plugin не найден в Python окружении. "
+            "Пересоберите контейнер без cache."
+        )
+
+    if not is_pot_provider_reachable(settings.pot_provider_url):
+        logger.warning(
+            "PO Token Provider запущен не полностью или недоступен из bot-контейнера."
+        )
 
 
 def get_info_file_size(info: dict[str, Any]) -> int | None:
@@ -462,6 +559,13 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
         for candidate_url in get_download_url_candidates(url):
             for strategy in YDL_DOWNLOAD_STRATEGIES:
                 strategy_name = str(strategy["name"])
+                if strategy.get("requires_pot") and not settings.pot_provider_url:
+                    logger.info(
+                        "Пропускаю стратегию '%s': YTDLP_POT_PROVIDER_URL не задан.",
+                        strategy_name,
+                    )
+                    continue
+
                 try:
                     logger.info("Пробую стратегию '%s': %s", strategy_name, candidate_url)
                     with YoutubeDL(
@@ -687,9 +791,7 @@ def main() -> None:
     settings = load_settings()
     application = build_application(settings)
 
-    logger.info("yt-dlp version: %s", YTDLP_VERSION)
-    if settings.pot_provider_url:
-        logger.info("YouTube PO Token provider: %s", settings.pot_provider_url)
+    log_youtube_runtime_state(settings)
     logger.info("Бот запущен. Остановить можно Ctrl+C.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
