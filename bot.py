@@ -25,7 +25,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
 from telegram import Message, Update
@@ -74,25 +74,46 @@ TELEGRAM_VIDEO_LIMIT_BYTES = TELEGRAM_VIDEO_LIMIT_MB * 1024 * 1024
 
 # YouTube иногда отдает Shorts с набором форматов, который отличается от обычных
 # видео. Поэтому не полагаемся на один жесткий selector, а пробуем несколько
-# стратегий: сначала ограниченные форматы, затем полностью дефолтный yt-dlp.
-YDL_DOWNLOAD_STRATEGIES: list[tuple[str, str | None, bool]] = [
-    (
-        "mp4 до 720p с YouTube client profiles",
-        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720][ext=mp4]",
-        True,
-    ),
-    (
-        "любой формат до 720p с YouTube client profiles",
-        "bv*[height<=720]+ba/b[height<=720]/bv*[height<=720]",
-        True,
-    ),
-    (
-        "best fallback с YouTube client profiles",
-        "best[height<=720]/best/bv*[height<=720]/bv*",
-        True,
-    ),
-    ("best с дефолтными настройками yt-dlp", "best", False),
-    ("полностью дефолтный выбор yt-dlp", None, False),
+# стратегий: сначала ограниченные форматы, затем разные YouTube clients, затем
+# максимально близкий к CLI-дефолту yt-dlp.
+YDL_DOWNLOAD_STRATEGIES: list[dict[str, Any]] = [
+    {
+        "name": "mp4 до 720p: web_safari/mweb/android_vr",
+        "format_selector": "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720][ext=mp4]",
+        "youtube_player_clients": ["web_safari", "mweb", "android_vr"],
+    },
+    {
+        "name": "любой формат до 720p: web_safari/mweb/android_vr",
+        "format_selector": "bv*[height<=720]+ba/b[height<=720]/bv*[height<=720]",
+        "youtube_player_clients": ["web_safari", "mweb", "android_vr"],
+    },
+    {
+        "name": "tv client",
+        "format_selector": None,
+        "youtube_player_clients": ["tv"],
+    },
+    {
+        "name": "ios/android clients",
+        "format_selector": None,
+        "youtube_player_clients": ["ios", "android"],
+    },
+    {
+        "name": "web/mweb clients",
+        "format_selector": None,
+        "youtube_player_clients": ["web", "mweb"],
+    },
+    {
+        "name": "best без YouTube client profiles",
+        "format_selector": "best",
+        "youtube_player_clients": None,
+    },
+    {
+        "name": "дефолтный yt-dlp без format/max_filesize/browser headers",
+        "format_selector": None,
+        "youtube_player_clients": None,
+        "use_browser_headers": False,
+        "use_max_filesize": False,
+    },
 ]
 
 
@@ -191,13 +212,41 @@ def extract_supported_urls(text: str) -> list[str]:
     return urls
 
 
+def normalize_url_for_download(url: str) -> str:
+    """
+    Приводит ссылку к более простой форме перед передачей в yt-dlp.
+
+    YouTube Shorts часто присылают с query-параметром ?si=... . Для просмотра он
+    не нужен, а для парсеров иногда создает лишний шум, поэтому оставляем только
+    схему, домен и путь /shorts/<id>.
+    """
+
+    parsed_url = urlparse(url)
+    hostname = parsed_url.hostname.lower() if parsed_url.hostname else ""
+
+    if hostname in YOUTUBE_SHORTS_DOMAINS and parsed_url.path.startswith("/shorts/"):
+        return urlunparse(
+            (
+                parsed_url.scheme or "https",
+                parsed_url.netloc,
+                parsed_url.path,
+                "",
+                "",
+                "",
+            )
+        )
+
+    return url
+
+
 def build_ydl_options(
     download_dir: Path,
     settings: Settings,
     *,
     use_max_filesize: bool = True,
     format_selector: str | None = None,
-    use_youtube_extractor_args: bool = True,
+    youtube_player_clients: list[str] | None = None,
+    use_browser_headers: bool = True,
 ) -> dict:
     """
     Собирает настройки yt-dlp.
@@ -219,7 +268,10 @@ def build_ydl_options(
         "fragment_retries": 3,
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 4,
-        "http_headers": {
+    }
+
+    if use_browser_headers:
+        options["http_headers"] = {
             # YouTube иногда хуже отвечает на дефолтный Python user-agent.
             # Обычный браузерный user-agent делает запросы менее "экзотичными".
             "User-Agent": (
@@ -227,16 +279,15 @@ def build_ydl_options(
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/126.0.0.0 Safari/537.36"
             ),
-        },
-    }
+        }
 
-    if use_youtube_extractor_args:
+    if youtube_player_clients:
         options["extractor_args"] = {
             # В свежем yt-dlp YouTube extractor умеет несколько client profiles.
             # Для некоторых Shorts они помогают, но если все форматы недоступны,
             # ниже есть fallback без этих аргументов.
             "youtube": {
-                "player_client": ["web_safari", "mweb", "android_vr"],
+                "player_client": youtube_player_clients,
             },
         }
 
@@ -337,7 +388,8 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
                     # размера. Не задаем format selector и не обрабатываем formats,
                     # иначе YouTube Shorts может упасть еще до fallback-скачивания.
                     format_selector=None,
-                    use_youtube_extractor_args=False,
+                    youtube_player_clients=None,
+                    use_browser_headers=False,
                 )
             ) as ydl:
                 info = ydl.extract_info(url, download=False, process=False)
@@ -354,15 +406,18 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
 
         info: dict[str, Any] | None = None
         last_format_error: DownloadError | None = None
-        for strategy_name, format_selector, use_youtube_extractor_args in YDL_DOWNLOAD_STRATEGIES:
+        for strategy in YDL_DOWNLOAD_STRATEGIES:
+            strategy_name = str(strategy["name"])
             try:
                 logger.info("Пробую стратегию '%s': %s", strategy_name, url)
                 with YoutubeDL(
                     build_ydl_options(
                         download_dir,
                         settings,
-                        format_selector=format_selector,
-                        use_youtube_extractor_args=use_youtube_extractor_args,
+                        format_selector=strategy.get("format_selector"),
+                        youtube_player_clients=strategy.get("youtube_player_clients"),
+                        use_browser_headers=bool(strategy.get("use_browser_headers", True)),
+                        use_max_filesize=bool(strategy.get("use_max_filesize", True)),
                     )
                 ) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -479,7 +534,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Чтобы не заспамить чат, обрабатываем первую поддерживаемую ссылку из сообщения.
     # При желании здесь можно пройтись циклом по всем urls.
-    url = urls[0]
+    url = normalize_url_for_download(urls[0])
     settings: Settings = context.application.bot_data["settings"]
 
     logger.info("Найдена ссылка в чате %s: %s", update.effective_chat.id, url)
