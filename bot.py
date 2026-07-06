@@ -73,13 +73,26 @@ TELEGRAM_VIDEO_LIMIT_MB = 50
 TELEGRAM_VIDEO_LIMIT_BYTES = TELEGRAM_VIDEO_LIMIT_MB * 1024 * 1024
 
 # YouTube иногда отдает Shorts с набором форматов, который отличается от обычных
-# видео. Поэтому не полагаемся на один жесткий selector, а пробуем несколько:
-# от желательного MP4 до максимально широкого "best".
-YDL_FORMAT_SELECTORS = [
-    "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720][ext=mp4]",
-    "bv*[height<=720]+ba/b[height<=720]/bv*[height<=720]",
-    "best[height<=720]/best/bv*[height<=720]/bv*",
-    "best",
+# видео. Поэтому не полагаемся на один жесткий selector, а пробуем несколько
+# стратегий: сначала ограниченные форматы, затем полностью дефолтный yt-dlp.
+YDL_DOWNLOAD_STRATEGIES: list[tuple[str, str | None, bool]] = [
+    (
+        "mp4 до 720p с YouTube client profiles",
+        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720][ext=mp4]",
+        True,
+    ),
+    (
+        "любой формат до 720p с YouTube client profiles",
+        "bv*[height<=720]+ba/b[height<=720]/bv*[height<=720]",
+        True,
+    ),
+    (
+        "best fallback с YouTube client profiles",
+        "best[height<=720]/best/bv*[height<=720]/bv*",
+        True,
+    ),
+    ("best с дефолтными настройками yt-dlp", "best", False),
+    ("полностью дефолтный выбор yt-dlp", None, False),
 ]
 
 
@@ -183,7 +196,8 @@ def build_ydl_options(
     settings: Settings,
     *,
     use_max_filesize: bool = True,
-    format_selector: str | None = YDL_FORMAT_SELECTORS[0],
+    format_selector: str | None = None,
+    use_youtube_extractor_args: bool = True,
 ) -> dict:
     """
     Собирает настройки yt-dlp.
@@ -214,15 +228,17 @@ def build_ydl_options(
                 "Chrome/126.0.0.0 Safari/537.36"
             ),
         },
-        "extractor_args": {
+    }
+
+    if use_youtube_extractor_args:
+        options["extractor_args"] = {
             # В свежем yt-dlp YouTube extractor умеет несколько client profiles.
-            # Явно просим несколько вариантов, чтобы Shorts не падали на первом
-            # неподходящем клиенте.
+            # Для некоторых Shorts они помогают, но если все форматы недоступны,
+            # ниже есть fallback без этих аргументов.
             "youtube": {
                 "player_client": ["web_safari", "mweb", "android_vr"],
             },
-        },
-    }
+        }
 
     if format_selector:
         # Для Telegram-группы обычно достаточно 720p. Сначала выбираем MP4,
@@ -321,6 +337,7 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
                     # размера. Не задаем format selector и не обрабатываем formats,
                     # иначе YouTube Shorts может упасть еще до fallback-скачивания.
                     format_selector=None,
+                    use_youtube_extractor_args=False,
                 )
             ) as ydl:
                 info = ydl.extract_info(url, download=False, process=False)
@@ -337,14 +354,15 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
 
         info: dict[str, Any] | None = None
         last_format_error: DownloadError | None = None
-        for format_selector in YDL_FORMAT_SELECTORS:
+        for strategy_name, format_selector, use_youtube_extractor_args in YDL_DOWNLOAD_STRATEGIES:
             try:
-                logger.info("Пробую скачать формат '%s': %s", format_selector, url)
+                logger.info("Пробую стратегию '%s': %s", strategy_name, url)
                 with YoutubeDL(
                     build_ydl_options(
                         download_dir,
                         settings,
                         format_selector=format_selector,
+                        use_youtube_extractor_args=use_youtube_extractor_args,
                     )
                 ) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -355,8 +373,8 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
 
                 last_format_error = exc
                 logger.info(
-                    "Формат '%s' недоступен, пробую следующий вариант: %s",
-                    format_selector,
+                    "Стратегия '%s' не нашла доступный формат, пробую следующую: %s",
+                    strategy_name,
                     url,
                 )
         else:
