@@ -17,18 +17,15 @@ Telegram-бот для автоматической отправки видео 
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import logging
 import os
 import re
 import shutil
 import tempfile
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from telegram import Message, Update
@@ -37,7 +34,6 @@ from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
-from yt_dlp.version import __version__ as YTDLP_VERSION
 
 
 # Логирование нужно не только для ошибок: по нему удобно понять, какие ссылки
@@ -53,9 +49,8 @@ logger = logging.getLogger(__name__)
 # После извлечения мы дополнительно проверяем домен, чтобы не трогать чужие ссылки.
 URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
 
-# Домены, которые бот считает поддерживаемыми без дополнительной проверки пути.
-# YouTube вынесен отдельно ниже, потому что нам нужны именно Shorts, а не любые
-# youtube-ссылки из чата.
+# Домены, которые бот считает поддерживаемыми.
+# Список можно расширить, если yt-dlp начнет поддерживать новые короткие домены.
 SUPPORTED_DOMAINS = {
     "instagram.com",
     "www.instagram.com",
@@ -73,63 +68,8 @@ YOUTUBE_SHORTS_DOMAINS = {
     "m.youtube.com",
 }
 
-YOUTUBE_DOMAINS = YOUTUBE_SHORTS_DOMAINS | {
-    "youtu.be",
-    "www.youtu.be",
-}
-
 TELEGRAM_VIDEO_LIMIT_MB = 50
 TELEGRAM_VIDEO_LIMIT_BYTES = TELEGRAM_VIDEO_LIMIT_MB * 1024 * 1024
-
-# YouTube иногда отдает Shorts с набором форматов, который отличается от обычных
-# видео. Поэтому не полагаемся на один жесткий selector, а пробуем несколько
-# стратегий: сначала ограниченные форматы, затем разные YouTube clients, затем
-# максимально близкий к CLI-дефолту yt-dlp.
-YDL_DOWNLOAD_STRATEGIES: list[dict[str, Any]] = [
-    {
-        "name": "mp4 до 720p: web_safari/mweb/android_vr",
-        "format_selector": "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720][ext=mp4]",
-        "youtube_player_clients": ["web_safari", "mweb", "android_vr"],
-    },
-    {
-        "name": "любой формат до 720p: web_safari/mweb/android_vr",
-        "format_selector": "bv*[height<=720]+ba/b[height<=720]/bv*[height<=720]",
-        "youtube_player_clients": ["web_safari", "mweb", "android_vr"],
-    },
-    {
-        "name": "mweb client с PO Token",
-        "format_selector": None,
-        "youtube_player_clients": ["mweb"],
-        "requires_pot": True,
-    },
-    {
-        "name": "tv client",
-        "format_selector": None,
-        "youtube_player_clients": ["tv"],
-    },
-    {
-        "name": "ios/android clients",
-        "format_selector": None,
-        "youtube_player_clients": ["ios", "android"],
-    },
-    {
-        "name": "web/mweb clients",
-        "format_selector": None,
-        "youtube_player_clients": ["web", "mweb"],
-    },
-    {
-        "name": "best без YouTube client profiles",
-        "format_selector": "best",
-        "youtube_player_clients": None,
-    },
-    {
-        "name": "дефолтный yt-dlp без format/max_filesize/browser headers",
-        "format_selector": None,
-        "youtube_player_clients": None,
-        "use_browser_headers": False,
-        "use_max_filesize": False,
-    },
-]
 
 
 @dataclass(frozen=True)
@@ -139,7 +79,6 @@ class Settings:
     bot_token: str
     max_video_mb: int
     cookies_file: Path | None
-    pot_provider_url: str | None
 
     @property
     def max_video_bytes(self) -> int:
@@ -165,24 +104,6 @@ class VideoTooLargeError(Exception):
         self.limit_mb = limit_mb
 
 
-class YtdlpLogger:
-    """Прокидывает сообщения yt-dlp в обычные логи приложения."""
-
-    def debug(self, message: str) -> None:
-        # yt-dlp пишет очень много debug-строк. В обычном режиме они только шумят.
-        if os.getenv("YTDLP_VERBOSE", "").strip() == "1":
-            logger.debug("yt-dlp: %s", message)
-
-    def info(self, message: str) -> None:
-        logger.info("yt-dlp: %s", message)
-
-    def warning(self, message: str) -> None:
-        logger.warning("yt-dlp: %s", message)
-
-    def error(self, message: str) -> None:
-        logger.error("yt-dlp: %s", message)
-
-
 def load_settings() -> Settings:
     """Загружает настройки из .env и окружения."""
 
@@ -204,13 +125,10 @@ def load_settings() -> Settings:
     if cookies_file and not cookies_file.exists():
         raise RuntimeError(f"Файл cookies не найден: {cookies_file}")
 
-    pot_provider_url = os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None
-
     return Settings(
         bot_token=bot_token,
         max_video_mb=max_video_mb,
         cookies_file=cookies_file,
-        pot_provider_url=pot_provider_url,
     )
 
 
@@ -227,13 +145,6 @@ def is_supported_url(url: str) -> bool:
         return parsed_url.path.startswith("/shorts/")
 
     return False
-
-
-def is_youtube_url(url: str) -> bool:
-    """Проверяет, что ссылка относится к YouTube."""
-
-    hostname = urlparse(url).hostname
-    return bool(hostname and hostname.lower() in YOUTUBE_DOMAINS)
 
 
 def extract_supported_urls(text: str) -> list[str]:
@@ -256,74 +167,11 @@ def extract_supported_urls(text: str) -> list[str]:
     return urls
 
 
-def normalize_url_for_download(url: str) -> str:
-    """
-    Приводит ссылку к более простой форме перед передачей в yt-dlp.
-
-    YouTube Shorts часто присылают с query-параметром ?si=... . Для просмотра он
-    не нужен, а для парсеров иногда создает лишний шум, поэтому оставляем только
-    схему, домен и путь /shorts/<id>.
-    """
-
-    parsed_url = urlparse(url)
-    hostname = parsed_url.hostname.lower() if parsed_url.hostname else ""
-
-    if hostname in YOUTUBE_SHORTS_DOMAINS and parsed_url.path.startswith("/shorts/"):
-        return urlunparse(
-            (
-                parsed_url.scheme or "https",
-                parsed_url.netloc,
-                parsed_url.path,
-                "",
-                "",
-                "",
-            )
-        )
-
-    return url
-
-
-def get_download_url_candidates(url: str) -> list[str]:
-    """
-    Возвращает варианты одной и той же ссылки для yt-dlp.
-
-    Для YouTube Shorts дополнительно пробуем обычный watch URL. Иногда YouTube
-    отдает разные metadata для /shorts/<id> и /watch?v=<id>, хотя это один ролик.
-    """
-
-    normalized_url = normalize_url_for_download(url)
-    parsed_url = urlparse(normalized_url)
-    hostname = parsed_url.hostname.lower() if parsed_url.hostname else ""
-
-    if hostname not in YOUTUBE_SHORTS_DOMAINS or not parsed_url.path.startswith("/shorts/"):
-        return [normalized_url]
-
-    video_id = parsed_url.path.removeprefix("/shorts/").strip("/")
-    if not video_id:
-        return [normalized_url]
-
-    watch_url = urlunparse(
-        (
-            parsed_url.scheme or "https",
-            parsed_url.netloc,
-            "/watch",
-            "",
-            f"v={video_id}",
-            "",
-        )
-    )
-
-    return [normalized_url, watch_url]
-
-
 def build_ydl_options(
     download_dir: Path,
     settings: Settings,
     *,
     use_max_filesize: bool = True,
-    format_selector: str | None = None,
-    youtube_player_clients: list[str] | None = None,
-    use_browser_headers: bool = True,
 ) -> dict:
     """
     Собирает настройки yt-dlp.
@@ -333,55 +181,14 @@ def build_ydl_options(
     """
 
     options = {
-        # Если YouTube отдает видео и аудио отдельно, ffmpeg склеит дорожки.
-        # Конкретный format selector добавляем ниже, чтобы можно было пробовать
-        # несколько вариантов для капризных Shorts.
-        "merge_output_format": "mp4",
+        # Скачиваем один лучший mp4-файл, если он доступен. Если платформа отдает
+        # видео/аудио отдельно, yt-dlp попробует собрать их через ffmpeg.
+        "format": "best[ext=mp4]/best",
         "outtmpl": str(download_dir / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
-        "no_warnings": False,
-        "logger": YtdlpLogger(),
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 30,
-        "concurrent_fragment_downloads": 4,
+        "no_warnings": True,
     }
-
-    if use_browser_headers:
-        options["http_headers"] = {
-            # YouTube иногда хуже отвечает на дефолтный Python user-agent.
-            # Обычный браузерный user-agent делает запросы менее "экзотичными".
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
-            ),
-        }
-
-    if youtube_player_clients:
-        options["extractor_args"] = {
-            # В свежем yt-dlp YouTube extractor умеет несколько client profiles.
-            # Для некоторых Shorts они помогают, но если все форматы недоступны,
-            # ниже есть fallback без этих аргументов.
-            "youtube": {
-                "player_client": youtube_player_clients,
-            },
-        }
-
-    if settings.pot_provider_url:
-        # YouTube постепенно требует PO Token для получения/скачивания форматов.
-        # bgutil-ytdlp-pot-provider отдает токены через HTTP, а yt-dlp-плагин
-        # подхватывает этот extractor arg и добавляет токены к YouTube-запросам.
-        options.setdefault("extractor_args", {})
-        options["extractor_args"]["youtubepot-bgutilhttp"] = {
-            "base_url": [settings.pot_provider_url],
-        }
-
-    if format_selector:
-        # Для Telegram-группы обычно достаточно 720p. Сначала выбираем MP4,
-        # но при ошибке выше по стеку попробуем менее строгие варианты.
-        options["format"] = format_selector
 
     if use_max_filesize:
         # Этот лимит не гарантирует, что файл всегда будет меньше лимита Telegram,
@@ -392,74 +199,6 @@ def build_ydl_options(
         options["cookiefile"] = str(settings.cookies_file)
 
     return options
-
-
-def is_requested_format_unavailable(exc: DownloadError) -> bool:
-    """Проверяет, что yt-dlp упал именно из-за неподходящего format selector."""
-
-    return "requested format is not available" in str(exc).lower()
-
-
-def is_pot_plugin_installed() -> bool:
-    """
-    Проверяет, видит ли Python yt-dlp plugin package.
-
-    У bgutil были разные внутренние имена модулей в релизах, поэтому проверяем
-    несколько вероятных путей. Если ни один не найден, PO Token Provider не будет
-    использоваться, даже если HTTP-сервис запущен.
-    """
-
-    plugin_modules = (
-        "yt_dlp_plugins.extractor.youtubepot_bgutil",
-        "yt_dlp_plugins.extractor.youtubepot_bgutilhttp",
-        "yt_dlp_plugins.extractor.bgutil",
-    )
-
-    for module_name in plugin_modules:
-        try:
-            if importlib.util.find_spec(module_name):
-                return True
-        except ModuleNotFoundError:
-            continue
-
-    return False
-
-
-def is_pot_provider_reachable(provider_url: str) -> bool:
-    """Проверяет, доступен ли HTTP PO Token Provider из контейнера бота."""
-
-    try:
-        with urllib.request.urlopen(provider_url, timeout=3):
-            return True
-    except urllib.error.HTTPError:
-        # HTTP-сервер ответил, даже если корневой путь вернул 404/405.
-        return True
-    except OSError as exc:
-        logger.warning("PO Token Provider недоступен по адресу %s: %s", provider_url, exc)
-        return False
-
-
-def log_youtube_runtime_state(settings: Settings) -> None:
-    """Пишет в лог состояние YouTube-зависимостей."""
-
-    logger.info("yt-dlp version: %s", YTDLP_VERSION)
-
-    if not settings.pot_provider_url:
-        logger.warning("YTDLP_POT_PROVIDER_URL не задан, YouTube PO Token отключен.")
-        return
-
-    logger.info("YouTube PO Token provider URL: %s", settings.pot_provider_url)
-
-    if not is_pot_plugin_installed():
-        logger.warning(
-            "bgutil-ytdlp-pot-provider plugin не найден в Python окружении. "
-            "Пересоберите контейнер без cache."
-        )
-
-    if not is_pot_provider_reachable(settings.pot_provider_url):
-        logger.warning(
-            "PO Token Provider запущен не полностью или недоступен из bot-контейнера."
-        )
 
 
 def get_info_file_size(info: dict[str, Any]) -> int | None:
@@ -527,77 +266,15 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
     before = list(download_dir.iterdir())
 
     try:
-        try:
-            with YoutubeDL(
-                build_ydl_options(
-                    download_dir,
-                    settings,
-                    use_max_filesize=False,
-                    # На preflight-шаге нам нужна только metadata для проверки
-                    # размера. Не задаем format selector и не обрабатываем formats,
-                    # иначе YouTube Shorts может упасть еще до fallback-скачивания.
-                    format_selector=None,
-                    youtube_player_clients=None,
-                    use_browser_headers=False,
-                )
-            ) as ydl:
-                info = ydl.extract_info(url, download=False, process=False)
-                if info:
-                    check_info_size(info, settings)
-        except DownloadError as exc:
-            if not is_requested_format_unavailable(exc):
-                raise
+        with YoutubeDL(
+            build_ydl_options(download_dir, settings, use_max_filesize=False)
+        ) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                check_info_size(info, settings)
 
-            logger.info(
-                "Preflight metadata не смог подобрать формат, перехожу к скачиванию: %s",
-                url,
-            )
-
-        info: dict[str, Any] | None = None
-        last_format_error: DownloadError | None = None
-        downloaded = False
-        for candidate_url in get_download_url_candidates(url):
-            for strategy in YDL_DOWNLOAD_STRATEGIES:
-                strategy_name = str(strategy["name"])
-                if strategy.get("requires_pot") and not settings.pot_provider_url:
-                    logger.info(
-                        "Пропускаю стратегию '%s': YTDLP_POT_PROVIDER_URL не задан.",
-                        strategy_name,
-                    )
-                    continue
-
-                try:
-                    logger.info("Пробую стратегию '%s': %s", strategy_name, candidate_url)
-                    with YoutubeDL(
-                        build_ydl_options(
-                            download_dir,
-                            settings,
-                            format_selector=strategy.get("format_selector"),
-                            youtube_player_clients=strategy.get("youtube_player_clients"),
-                            use_browser_headers=bool(strategy.get("use_browser_headers", True)),
-                            use_max_filesize=bool(strategy.get("use_max_filesize", True)),
-                        )
-                    ) as ydl:
-                        info = ydl.extract_info(candidate_url, download=True)
-                    downloaded = True
-                    break
-                except DownloadError as exc:
-                    if not is_requested_format_unavailable(exc):
-                        raise
-
-                    last_format_error = exc
-                    logger.info(
-                        "Стратегия '%s' не нашла доступный формат, пробую следующую: %s",
-                        strategy_name,
-                        candidate_url,
-                    )
-
-            if downloaded:
-                break
-        else:
-            if last_format_error:
-                raise last_format_error
-            raise RuntimeError("Не удалось подобрать формат видео для скачивания.")
+        with YoutubeDL(build_ydl_options(download_dir, settings)) as ydl:
+            info = ydl.extract_info(url, download=True)
 
         video_path = find_downloaded_file(before, download_dir)
         return DownloadedVideo(path=video_path, title=info.get("title") if info else None)
@@ -696,7 +373,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Чтобы не заспамить чат, обрабатываем первую поддерживаемую ссылку из сообщения.
     # При желании здесь можно пройтись циклом по всем urls.
-    url = normalize_url_for_download(urls[0])
+    url = urls[0]
     settings: Settings = context.application.bot_data["settings"]
 
     logger.info("Найдена ссылка в чате %s: %s", update.effective_chat.id, url)
@@ -755,15 +432,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.exception("yt-dlp не смог скачать видео по ссылке %s", url)
         await status_message.edit_text(
             "Не получилось скачать видео. "
-            "Обновите yt-dlp и, если это YouTube/Instagram, попробуйте cookies-файл. "
-            "Подробная причина есть в логах бота."
+            "Возможно, ссылка приватная, нужен cookies-файл или платформа временно изменила защиту."
         )
     except Exception as exc:
         logger.exception("Не удалось обработать ссылку %s", url)
         await status_message.edit_text(
             "Не получилось скачать видео. "
-            "Обновите yt-dlp и, если это YouTube/Instagram, попробуйте cookies-файл. "
-            "Подробная причина есть в логах бота."
+            "Возможно, ссылка приватная, нужен cookies-файл или платформа временно изменила защиту."
         )
     finally:
         if video:
@@ -791,7 +466,6 @@ def main() -> None:
     settings = load_settings()
     application = build_application(settings)
 
-    log_youtube_runtime_state(settings)
     logger.info("Бот запущен. Остановить можно Ctrl+C.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

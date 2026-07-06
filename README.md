@@ -7,7 +7,7 @@
 1. Добавьте бота в группу.
 2. В BotFather отключите privacy mode: `Bot Settings` -> `Group Privacy` -> `Turn off`.
 3. Дайте боту право читать сообщения в группе.
-4. Для Instagram и иногда YouTube Shorts может понадобиться cookies-файл, иначе часть ссылок не будет скачиваться.
+4. Для Instagram может понадобиться cookies-файл, иначе часть ссылок не будет скачиваться.
 
 ## Установка
 
@@ -55,16 +55,6 @@ touch cookies.txt
 docker compose up -d --build
 ```
 
-После изменения кода или `requirements.txt` обязательно пересоберите контейнер:
-
-```bash
-docker compose up -d --build
-```
-
-Для YouTube Shorts в `docker-compose.yml` поднимается отдельный сервис
-`pot-provider`. Он нужен `yt-dlp`, потому что YouTube постепенно требует
-PO Token для получения ссылок на видеоформаты.
-
 Посмотреть логи:
 
 ```bash
@@ -77,27 +67,12 @@ docker compose logs -f bot
 docker compose down
 ```
 
-## Cookies для Instagram/TikTok/YouTube
+## Cookies для Instagram/TikTok
 
-Если `yt-dlp` пишет, что видео недоступно, требует логин, просит подтвердить, что вы не бот, или не может скачать Instagram/YouTube, экспортируйте cookies из браузера в файл `cookies.txt`, положите его в папку проекта и укажите:
+Если `yt-dlp` пишет, что видео недоступно, требует логин или не может скачать Instagram, экспортируйте cookies из браузера в файл `cookies.txt`, положите его в папку проекта и укажите:
 
 ```env
 COOKIES_FILE=cookies.txt
 ```
 
 Используйте cookies только своего аккаунта и не публикуйте этот файл.
-
-## YouTube Shorts и PO Token
-
-Если YouTube Shorts падают с ошибкой `Requested format is not available`, это
-часто значит, что YouTube не отдал `yt-dlp` доступные видеоформаты. В Docker
-для этого уже подключен `bgutil-ytdlp-pot-provider`:
-
-```bash
-docker compose build --no-cache
-docker compose up -d
-docker compose logs -f bot
-```
-
-В начале логов бот пишет версию `yt-dlp` и URL PO Token Provider. Если версия
-`yt-dlp` старая, пересоберите контейнер без cache.
