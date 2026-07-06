@@ -72,6 +72,16 @@ YOUTUBE_SHORTS_DOMAINS = {
 TELEGRAM_VIDEO_LIMIT_MB = 50
 TELEGRAM_VIDEO_LIMIT_BYTES = TELEGRAM_VIDEO_LIMIT_MB * 1024 * 1024
 
+# YouTube иногда отдает Shorts с набором форматов, который отличается от обычных
+# видео. Поэтому не полагаемся на один жесткий selector, а пробуем несколько:
+# от желательного MP4 до максимально широкого "best".
+YDL_FORMAT_SELECTORS = [
+    "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720][ext=mp4]",
+    "bv*[height<=720]+ba/b[height<=720]/bv*[height<=720]",
+    "best[height<=720]/best/bv*[height<=720]/bv*",
+    "best",
+]
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -173,6 +183,7 @@ def build_ydl_options(
     settings: Settings,
     *,
     use_max_filesize: bool = True,
+    format_selector: str | None = YDL_FORMAT_SELECTORS[0],
 ) -> dict:
     """
     Собирает настройки yt-dlp.
@@ -182,14 +193,9 @@ def build_ydl_options(
     """
 
     options = {
-        # Стараемся получить MP4 до 720p: для Telegram-группы это обычно хороший
-        # баланс качества и размера. YouTube часто отдает видео и аудио отдельно,
-        # поэтому ffmpeg в Dockerfile нужен для склейки этих дорожек.
-        "format": (
-            "bv*[height<=720][ext=mp4]+ba[ext=m4a]/"
-            "b[height<=720][ext=mp4]/"
-            "bv*[height<=720]+ba/b[height<=720]/best"
-        ),
+        # Если YouTube отдает видео и аудио отдельно, ffmpeg склеит дорожки.
+        # Конкретный format selector добавляем ниже, чтобы можно было пробовать
+        # несколько вариантов для капризных Shorts.
         "merge_output_format": "mp4",
         "outtmpl": str(download_dir / "%(title).80s-%(id)s.%(ext)s"),
         "noplaylist": True,
@@ -218,6 +224,11 @@ def build_ydl_options(
         },
     }
 
+    if format_selector:
+        # Для Telegram-группы обычно достаточно 720p. Сначала выбираем MP4,
+        # но при ошибке выше по стеку попробуем менее строгие варианты.
+        options["format"] = format_selector
+
     if use_max_filesize:
         # Этот лимит не гарантирует, что файл всегда будет меньше лимита Telegram,
         # но помогает yt-dlp заранее отказаться от слишком больших роликов.
@@ -227,6 +238,12 @@ def build_ydl_options(
         options["cookiefile"] = str(settings.cookies_file)
 
     return options
+
+
+def is_requested_format_unavailable(exc: DownloadError) -> bool:
+    """Проверяет, что yt-dlp упал именно из-за неподходящего format selector."""
+
+    return "requested format is not available" in str(exc).lower()
 
 
 def get_info_file_size(info: dict[str, Any]) -> int | None:
@@ -295,14 +312,48 @@ def download_video_sync(url: str, settings: Settings) -> DownloadedVideo:
 
     try:
         with YoutubeDL(
-            build_ydl_options(download_dir, settings, use_max_filesize=False)
+            build_ydl_options(
+                download_dir,
+                settings,
+                use_max_filesize=False,
+                # Для проверки metadata берем самый широкий selector. Так preflight
+                # не падает на YouTube Shorts только из-за того, что MP4-вариант
+                # недоступен для конкретного ролика.
+                format_selector="best/bv*",
+            )
         ) as ydl:
             info = ydl.extract_info(url, download=False)
             if info:
                 check_info_size(info, settings)
 
-        with YoutubeDL(build_ydl_options(download_dir, settings)) as ydl:
-            info = ydl.extract_info(url, download=True)
+        info: dict[str, Any] | None = None
+        last_format_error: DownloadError | None = None
+        for format_selector in YDL_FORMAT_SELECTORS:
+            try:
+                logger.info("Пробую скачать формат '%s': %s", format_selector, url)
+                with YoutubeDL(
+                    build_ydl_options(
+                        download_dir,
+                        settings,
+                        format_selector=format_selector,
+                    )
+                ) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                break
+            except DownloadError as exc:
+                if not is_requested_format_unavailable(exc):
+                    raise
+
+                last_format_error = exc
+                logger.info(
+                    "Формат '%s' недоступен, пробую следующий вариант: %s",
+                    format_selector,
+                    url,
+                )
+        else:
+            if last_format_error:
+                raise last_format_error
+            raise RuntimeError("Не удалось подобрать формат видео для скачивания.")
 
         video_path = find_downloaded_file(before, download_dir)
         return DownloadedVideo(path=video_path, title=info.get("title") if info else None)
