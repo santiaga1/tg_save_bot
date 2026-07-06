@@ -1,9 +1,9 @@
 """
-Telegram-бот для автоматической отправки видео из Instagram, TikTok и YouTube Shorts.
+Telegram-бот для автоматической отправки видео из Instagram и TikTok.
 
 Как работает:
 1. Бот получает каждое текстовое сообщение в группе.
-2. Ищет в тексте ссылки на Instagram, TikTok или YouTube Shorts.
+2. Ищет в тексте ссылки на Instagram или TikTok.
 3. Скачивает первое найденное видео через yt-dlp.
 4. Отправляет скачанный файл обратно в тот же чат.
 
@@ -60,12 +60,6 @@ SUPPORTED_DOMAINS = {
     "www.tiktok.com",
     "vm.tiktok.com",
     "vt.tiktok.com",
-}
-
-YOUTUBE_SHORTS_DOMAINS = {
-    "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
 }
 
 TELEGRAM_VIDEO_LIMIT_MB = 50
@@ -138,18 +132,12 @@ def is_supported_url(url: str) -> bool:
     parsed_url = urlparse(url)
     hostname = parsed_url.hostname.lower() if parsed_url.hostname else ""
 
-    if hostname in SUPPORTED_DOMAINS:
-        return True
-
-    if hostname in YOUTUBE_SHORTS_DOMAINS:
-        return parsed_url.path.startswith("/shorts/")
-
-    return False
+    return hostname in SUPPORTED_DOMAINS
 
 
 def extract_supported_urls(text: str) -> list[str]:
     """
-    Достает из текста ссылки Instagram/TikTok/YouTube Shorts.
+    Достает из текста ссылки Instagram/TikTok.
 
     Telegram может прислать ссылку с пунктуацией в конце, например:
     "смотри https://vm.tiktok.com/abc/."
